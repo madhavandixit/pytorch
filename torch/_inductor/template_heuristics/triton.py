@@ -653,6 +653,8 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
 
     def _get_exceeding_shared_memory_checker(
         self,
+        has_sm_layout_conversion: bool = False,
+        layout_conversion_byte_size: int = 0,
     ) -> Optional[Callable[[BaseConfig, int], bool]]:
         """
         Returns a function that checks whether a given configuration exceeds the available shared memory for the device.
@@ -675,11 +677,28 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
 
         # TODO make a BaseDeviceConfigHeuristics to handle different device configuration in its own implementation.
         def exceeds(gemm_config: BaseConfig, dtype_size: int) -> bool:
-            shared_mem_accum = dtype_size * (
+            shared_mem_loads = dtype_size * (
                 gemm_config.block_m * gemm_config.block_k
                 + gemm_config.block_n * gemm_config.block_k
             )
-            return shared_mem_accum * gemm_config.num_stages > sm_available
+
+            # In persistent tma case, the layout conversion from mma -> blocked layout
+            # is not free and takes additional shared memory, while next loads are prefetched
+            # For addmm, the conversion is in the acc dtype, as it is needed before the bias addition
+            # For mm, the conversion is in the output dtype, as it happens before the store
+            if has_sm_layout_conversion:
+                shared_mem_epilogue = (
+                    layout_conversion_byte_size
+                    * gemm_config.block_m
+                    * gemm_config.block_n
+                )
+            else:
+                shared_mem_epilogue = 0
+
+            return (
+                shared_mem_loads * gemm_config.num_stages + shared_mem_epilogue
+                > sm_available
+            )
 
         return exceeds
 
@@ -687,11 +706,17 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         self,
         configs: list[BaseConfig],
         dtype_size: int,
+        shared_mem_checker_opts: Optional[dict[str, Any]] = None,
     ) -> list[BaseConfig]:
         if dtype_size <= 0:
             return configs
 
-        is_exceeding_shared_memory = self._get_exceeding_shared_memory_checker()
+        shared_mem_checker_kwargs = (
+            shared_mem_checker_opts if shared_mem_checker_opts else {}
+        )
+        is_exceeding_shared_memory = self._get_exceeding_shared_memory_checker(
+            **shared_mem_checker_kwargs
+        )
         if is_exceeding_shared_memory is None:
             return configs
 
@@ -744,6 +769,7 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         ] = lambda m, n, k: False,
         dtype_size: int = 0,
         op_name: str = "mm",  # For preprocessing overrides e.g. on CPU
+        shared_mem_checker_opts: Optional[dict[str, Any]] = None,
     ) -> Generator[TritonConfig, None, None]:
         configs = self._filter_configs(configs)
         scaled_configs = self._scale_mm_configs(
@@ -753,7 +779,7 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         # Filter out configs that require more shared memory than is available.
         if config.max_autotune_prune_choices_based_on_shared_mem:
             scaled_configs = self._prune_exceeding_max_shared_mem_configs(
-                scaled_configs, dtype_size
+                scaled_configs, dtype_size, shared_mem_checker_opts
             )
 
         if config.max_autotune_gemm_search_space == "EXHAUSTIVE":
@@ -1639,6 +1665,7 @@ class MMTemplateConfigMixin(GemmMaxAutotuneTemplateConfigHeuristics):
         self,
         kernel_inputs: KernelInputs,
         op_name: str,
+        shared_mem_checker_opts: Optional[dict[str, Any]] = None,
     ) -> Generator[dict[str, Any], None, None]:
         """
         Convert config lists to template kwargs.
@@ -1663,7 +1690,14 @@ class MMTemplateConfigMixin(GemmMaxAutotuneTemplateConfigHeuristics):
         configs = self._get_config_generator()
 
         # Generate and process configs
-        for c in configs(m, n, k, dtype_size=dtype.itemsize, op_name=op_name):
+        for c in configs(
+            m,
+            n,
+            k,
+            dtype_size=dtype.itemsize,
+            op_name=op_name,
+            shared_mem_checker_opts=shared_mem_checker_opts,
+        ):
             template_kwargs = self._convert_config_to_template_kwargs(
                 c,
                 m,
@@ -1814,6 +1848,14 @@ class TMATemplateConfigMixin(TMAWorkspaceMixin, MMTemplateConfigMixin):
         for template_kwargs in super()._get_template_configs_impl(
             kernel_inputs,
             op_name,
+            shared_mem_checker_opts={
+                "has_sm_layout_conversion": True,
+                # addmm requires the acc dtype for layout conversion due to adding bias
+                # mm just input dtype
+                "layout_conversion_byte_size": 4
+                if op_name == "addmm"
+                else kernel_inputs.dtype().itemsize,
+            },
         ):
             yield {**template_kwargs, **tma_opts}
 

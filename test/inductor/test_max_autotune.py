@@ -47,6 +47,8 @@ from torch._inductor.select_algorithm import (
 )
 from torch._inductor.template_heuristics.registry import override_template_heuristics
 from torch._inductor.template_heuristics.triton import (
+    CUDAAddmmPersistentTMATemplateConfigHeuristic,
+    CUDAAddMMTemplateConfigHeuristic,
     CUDAMMTemplateConfigHeuristic,
     CUDAPersistentTMATemplateConfigHeuristic,
     GemmConfig,
@@ -2165,26 +2167,6 @@ class TestMaxAutotune(TestCase):
             out, code = run_and_get_code(compiled_f, a, b)
             torch.testing.assert_close(out, mm(a, b), atol=1e-2, rtol=1e-2)
 
-    @config.patch(
-        max_autotune_gemm=True,
-        max_autotune_prune_choices_based_on_shared_mem=True,
-    )
-    def test_max_autotune_prune_choices(self):
-        def mm(x, y):
-            return x @ y
-
-        M, K, N = (3, 3, 3)
-
-        x = torch.rand([M, K], device=GPU_TYPE, dtype=torch.float32)
-        y = torch.rand([K, N], device=GPU_TYPE, dtype=torch.float32)
-
-        compiled_f = torch.compile(mm)
-        compiled_f(x, y)
-
-        self.assertEqual(
-            counters["inductor"]["select_algorithm_num_precompilation_exceptions"], 0
-        )
-
     @parametrize("op", ("mm", "addmm", "bmm", "baddbmm", "mm_plus_mm"))
     @parametrize("max_autotune", (False, True))
     @config.patch(
@@ -2373,6 +2355,124 @@ class TestMaxAutotune(TestCase):
 
         self.assertObjectIn(k, (15, 16))
         self.assertEqual("'EVEN_K': True" in cache_key, k == 16 and not dynamic)
+
+
+class TestTemplateConfigPruning(TestCase):
+    """Test class for pruning logic in GEMM autotuning."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # Initialize heuristics once for all tests
+        cls.addmm_tma_heuristic = CUDAAddmmPersistentTMATemplateConfigHeuristic()
+        cls.addmm_heuristic = CUDAAddMMTemplateConfigHeuristic()
+        cls.mm_tma_heuristic = CUDAPersistentTMATemplateConfigHeuristic()
+        cls.mm_heuristic = CUDAMMTemplateConfigHeuristic()
+
+    def setUp(self):
+        super().setUp()
+        # Save original configs to restore in tearDown
+        self.original_tma_mm_configs = self.mm_tma_heuristic.mm_configs
+        self.original_mm_mm_configs = self.mm_heuristic.mm_configs
+        self.original_addmm_tma_configs = self.addmm_tma_heuristic.mm_configs
+        self.original_addmm_configs = self.addmm_heuristic.mm_configs
+
+    def tearDown(self):
+        # Restore original configs
+        self.addmm_tma_heuristic.mm_configs = self.original_addmm_tma_configs
+        self.addmm_heuristic.mm_configs = self.original_addmm_configs
+        self.mm_tma_heuristic.mm_configs = self.original_tma_mm_configs
+        self.mm_heuristic.mm_configs = self.original_mm_mm_configs
+        super().tearDown()
+
+    @contextlib.contextmanager
+    def pruning_config_context(self):
+        """Context manager for shared memory pruning configuration."""
+        with (
+            config.patch(
+                {
+                    "max_autotune_prune_choices_based_on_shared_mem": True,
+                    "triton.enable_persistent_tma_matmul": True,
+                }
+            ),
+            fresh_cache(),
+        ):
+            yield
+
+    def create_test_tensors(self, M, N, K, include_bias=False):
+        """Create test tensors for GEMM operations."""
+        mat1 = torch.randn(M, K, dtype=torch.bfloat16, device=GPU_TYPE)
+        mat2_t = torch.randn(N, K, dtype=torch.bfloat16, device=GPU_TYPE)
+        mat2 = mat2_t.t()
+
+        if include_bias:
+            bias_1d = torch.randn(N, dtype=torch.bfloat16, device=GPU_TYPE)
+            return bias_1d, mat1, mat2
+        return mat1, mat2
+
+    def test_max_autotune_prune_choices(self):
+        def mm(x, y):
+            return x @ y
+
+        M, K, N = (3, 3, 3)
+
+        x = torch.rand([M, K], device=GPU_TYPE, dtype=torch.float32)
+        y = torch.rand([K, N], device=GPU_TYPE, dtype=torch.float32)
+
+        compiled_f = torch.compile(mm, mode="max-autotune")
+        compiled_f(x, y)
+
+        self.assertEqual(
+            counters["inductor"]["select_algorithm_num_precompilation_exceptions"], 0
+        )
+
+    def test_shared_memory_pruning_addmm_tma(self):
+        """Test shared memory pruning for addmm operation."""
+
+        def addmm_op(bias, mat1, mat2):
+            return torch.addmm(bias, mat1, mat2)
+
+        M, K, N = 4608, 256, 6144
+        bad_addmm_tma_config = GemmConfig(256, 128, 64, 4, 8, group_m=8)
+
+        # Configure heuristics to use only the bad config
+        self.addmm_tma_heuristic.mm_configs = [bad_addmm_tma_config]
+        self.addmm_heuristic.mm_configs = []
+
+        bias_1d, mat1, mat2 = self.create_test_tensors(M, N, K, include_bias=True)
+
+        with self.pruning_config_context():
+            compiled_fn = torch.compile(addmm_op, mode="max-autotune")
+            run_and_get_code(compiled_fn, bias_1d, mat1, mat2)
+            # Should still benchmark extern kernels (2 benchmarks)
+            self.assertEqual(
+                counters["inductor"]["benchmarking.TritonBenchmarker.benchmark"], 2
+            )
+
+    @unittest.skipIf(not has_triton_tma_device(), "Need TMA support in Triton")
+    def test_shared_memory_pruning_mm_tma(self):
+        """Test shared memory pruning for persistent TMA matmul operation."""
+
+        def mm_op(mat1, mat2):
+            return mat1 @ mat2
+
+        M, K, N = 4608, 256, 6144
+        bad_mm_tma_config = GemmConfig(128, 256, 64, 4, 8, group_m=8)
+
+        # Configure heuristics to use only the bad config
+        self.mm_tma_heuristic.mm_configs = [bad_mm_tma_config]
+        self.mm_heuristic.mm_configs = []
+
+        mat1, mat2 = self.create_test_tensors(M, N, K, include_bias=False)
+
+        with self.pruning_config_context():
+            counters.clear()
+            compiled_fn = torch.compile(mm_op, mode="max-autotune")
+            run_and_get_code(compiled_fn, mat1, mat2)
+            # No benchmarking should occur since the only triton config was pruned
+            self.assertTrue(
+                "benchmarking.TritonBenchmarker.benchmark" not in counters["inductor"]
+            )
 
 
 class TestMaxAutotunePrecompile(TestCase):
